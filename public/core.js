@@ -704,6 +704,282 @@
     return false;
   }
 
+  // ---------- 方案快照：两场景对比 ----------
+
+  var DIFF_EPS = 1e-6;   // 区间端点"时间变化"判定容差（秒）
+  var DIFF_KEY_SEP = '\u0001'; // 名字配对键分隔符（正常名字中不会出现）
+
+  function performerNameMap(performers) {
+    // 同名配对：重名时以后出现者为准（UI 侧名称由用户自行区分）
+    var map = {};
+    (performers || []).forEach(function (p) {
+      map[String(p.name || p.id)] = p;
+    });
+    return map;
+  }
+
+  function performerNames(performers) {
+    var seen = {};
+    var out = [];
+    (performers || []).forEach(function (p) {
+      var n = String(p.name || p.id);
+      if (!seen[n]) { seen[n] = true; out.push(n); }
+    });
+    return out;
+  }
+
+  /**
+   * 在统一时刻轴上求同一表演者两套关键帧的位置偏移模
+   *     Δ(t) = |pA(t) − pB(t)|
+   * 最大值。两侧位置在相邻关键帧间都是 t 的一次函数，故差值仍为一次、
+   * 其模为凸函数——每段最大值必在段端点，只需考察双方关键帧时刻
+   * （含 0 与两侧时长）的并集即可精确得到全局最大，不做时间采样。
+   * 帧外按段外静止语义保持末帧位置（与 buildSegments 一致）。
+   */
+  function maxPositionOffset(pa, pb, durationA, durationB) {
+    var ksA = normalizeKeys(pa.keys);
+    var ksB = normalizeKeys(pb.keys);
+    var T = Math.max(durationA, durationB);
+    var times = [0, durationA, durationB, T];
+    ksA.forEach(function (k) { if (k.t >= -EPS && k.t <= T + EPS) times.push(Math.max(0, k.t)); });
+    ksB.forEach(function (k) { if (k.t >= -EPS && k.t <= T + EPS) times.push(Math.max(0, k.t)); });
+    times.sort(function (a, b) { return a - b; });
+
+    var best = -1;
+    var bestT = 0;
+    var prev = null;
+    for (var i = 0; i < times.length; i++) {
+      var t = times[i];
+      if (prev !== null && t - prev < EPS) continue;
+      prev = t;
+      var qa = positionAt(ksA, t);
+      var qb = positionAt(ksB, t);
+      var off = Math.sqrt((qa.x - qb.x) * (qa.x - qb.x) + (qa.y - qb.y) * (qa.y - qb.y));
+      if (off > best + EPS) { best = off; bestT = t; }
+    }
+    if (best < 0) best = 0;
+    return { maxOffset: best, maxOffsetT: bestT };
+  }
+
+  function intervalsEqual(a, b) {
+    var tol = DIFF_EPS + MERGE_REL * Math.max(Math.abs(a[0]), Math.abs(a[1]), Math.abs(b[0]), Math.abs(b[1]), 1);
+    return Math.abs(a[0] - b[0]) <= tol && Math.abs(a[1] - b[1]) <= tol;
+  }
+
+  /**
+   * 两组已合并区间的差分：按最大时间重叠贪心配对
+   * （零长度相切区间与包含它的区间也可配对）。
+   * 返回 { added:新方案独有, removed:旧方案独有,
+   *        changed:[{from:[a,b], to:[a',b']}]（端点变化）}。
+   */
+  function diffIntervalLists(oldIv, newIv) {
+    var used = oldIv.map(function () { return false; });
+    var added = [];
+    var changed = [];
+
+    newIv.forEach(function (nv) {
+      var bi = -1;
+      var bestOv = -Infinity;
+      for (var i = 0; i < oldIv.length; i++) {
+        if (used[i]) continue;
+        var ov = Math.min(oldIv[i][1], nv[1]) - Math.max(oldIv[i][0], nv[0]);
+        // ov≥-EPS 即可配：含端点相接（零长度相切点落在另一区间上）
+        if (ov >= -DIFF_EPS && ov > bestOv) { bestOv = ov; bi = i; }
+      }
+      if (bi < 0) {
+        added.push(nv.slice());
+        return;
+      }
+      used[bi] = true;
+      if (!intervalsEqual(oldIv[bi], nv)) {
+        changed.push({ from: oldIv[bi].slice(), to: nv.slice() });
+      }
+    });
+
+    var removed = [];
+    for (var j = 0; j < oldIv.length; j++) {
+      if (!used[j]) removed.push(oldIv[j].slice());
+    }
+    return { added: added, removed: removed, changed: changed };
+  }
+
+  function firstIvStart(list) {
+    return list && list.length ? list[0][0] : Infinity;
+  }
+
+  /**
+   * 方案快照对比（浏览器/Node 通用，零依赖）。
+   * sceneA 为基准方案（方案 1），sceneB 为新方案（方案 2）：
+   *  - 同名表演者关键帧在统一时刻轴 [0, max(dA,dB)] 上线性插值，
+   *    逐人给位置偏移最大值与发生时刻，并给全局最大；
+   *  - 碰撞对按两人名字配对，分 added（仅方案 2 碰撞）/ removed
+   *    （仅方案 1 碰撞）/ changed（都碰撞但区间端点变化）；
+   *  - 禁入区间按 表演者名 × 矩形名 配对，分类同上；
+   *  - 表演者、矩形本身的增删单列。
+   * 返回：
+   * { duration, durationA, durationB,
+   *   performers:[{name,presentA,presentB,maxOffset,maxOffsetT}]（偏移降序），
+   *   maxOffset/maxOffsetT/maxOffsetPerformer,
+   *   pairs:{added,removed,changed,unchangedCount},
+   *   obstacleIntrusions:{added,removed,changed,unchangedCount},
+   *   addedPerformers,removedPerformers,addedObstacles,removedObstacles }
+   */
+  function compareScenes(sceneA, sceneB) {
+    var dA = Number(sceneA && sceneA.duration);
+    var dB = Number(sceneB && sceneB.duration);
+    if (!(dA > 0) || !(dB > 0)) throw new Error('duration 必须为正数');
+    var T = Math.max(dA, dB);
+
+    var perfA = sceneA.performers || [];
+    var perfB = sceneB.performers || [];
+    var mapA = performerNameMap(perfA);
+    var mapB = performerNameMap(perfB);
+
+    var namesA = performerNames(perfA);
+    var namesB = performerNames(perfB);
+    var nameSetA = {}; namesA.forEach(function (n) { nameSetA[n] = true; });
+    var nameSetB = {}; namesB.forEach(function (n) { nameSetB[n] = true; });
+    var allNames = namesA.slice();
+    namesB.forEach(function (n) { if (!nameSetA[n]) allNames.push(n); });
+
+    var performerDiffs = [];
+    allNames.forEach(function (name) {
+      var inA = !!mapA[name];
+      var inB = !!mapB[name];
+      if (inA && inB) {
+        var mo = maxPositionOffset(mapA[name], mapB[name], dA, dB);
+        performerDiffs.push({
+          name: name, presentA: true, presentB: true,
+          maxOffset: mo.maxOffset, maxOffsetT: mo.maxOffsetT
+        });
+      } else {
+        performerDiffs.push({
+          name: name, presentA: inA, presentB: inB,
+          maxOffset: null, maxOffsetT: null
+        });
+      }
+    });
+    // 双方共有者按偏移降序（并列按名字稳定），仅单侧存在者附后
+    performerDiffs.sort(function (x, y) {
+      if (x.maxOffset === null && y.maxOffset === null) return x.name < y.name ? -1 : (x.name > y.name ? 1 : 0);
+      if (x.maxOffset === null) return 1;
+      if (y.maxOffset === null) return -1;
+      if (Math.abs(y.maxOffset - x.maxOffset) > EPS) return y.maxOffset - x.maxOffset;
+      if (Math.abs(y.maxOffsetT - x.maxOffsetT) > EPS) return x.maxOffsetT - y.maxOffsetT;
+      return x.name < y.name ? -1 : (x.name > y.name ? 1 : 0);
+    });
+    var common = performerDiffs.filter(function (d) { return d.maxOffset !== null; });
+    var globalMax = common.length ? common[0] : null;
+
+    // —— 碰撞对差分（按双方表演者名字配对）——
+    var anA = analyzeScene({ duration: dA, performers: perfA, obstacles: sceneA.obstacles });
+    var anB = analyzeScene({ duration: dB, performers: perfB, obstacles: sceneB.obstacles });
+
+    function pairIndex(analysis) {
+      var map = {};
+      analysis.pairs.forEach(function (p) {
+        var key = [p.aName, p.bName].sort().join(DIFF_KEY_SEP);
+        map[key] = p;
+      });
+      return map;
+    }
+
+    var piA = pairIndex(anA);
+    var piB = pairIndex(anB);
+    var pairKeys = Object.keys(piA);
+    Object.keys(piB).forEach(function (k) { if (piA[k] === undefined) pairKeys.push(k); });
+    pairKeys.sort();
+
+    var pairs = { added: [], removed: [], changed: [], unchangedCount: 0 };
+    pairKeys.forEach(function (key) {
+      var pa = piA[key];
+      var pb = piB[key];
+      if (!pa || !pb) return; // 有一方缺该表演者：随 addedPerformers 列出
+      var names = key.split(DIFF_KEY_SEP);
+      if (pa.collision && pb.collision) {
+        var dc = diffIntervalLists(pa.intervals, pb.intervals);
+        if (!dc.added.length && !dc.removed.length && !dc.changed.length) {
+          pairs.unchangedCount++;
+        } else {
+          pairs.changed.push(Object.assign({ names: names }, dc));
+        }
+      } else if (pb.collision) {
+        pairs.added.push({ names: names, intervals: pb.intervals.map(function (iv) { return iv.slice(); }) });
+      } else if (pa.collision) {
+        pairs.removed.push({ names: names, intervals: pa.intervals.map(function (iv) { return iv.slice(); }) });
+      }
+    });
+    pairs.added.sort(function (a, b) { return firstIvStart(a.intervals) - firstIvStart(b.intervals); });
+    pairs.removed.sort(function (a, b) { return firstIvStart(a.intervals) - firstIvStart(b.intervals); });
+    pairs.changed.sort(function (a, b) {
+      return firstIvStart(flatNew(a)) - firstIvStart(flatNew(b));
+    });
+    function flatNew(c) {
+      if (c.added.length) return c.added[0];
+      if (c.changed.length) return c.changed[0].to;
+      return c.removed.length ? c.removed[0] : [Infinity, Infinity];
+    }
+
+    // —— 禁入区间差分（表演者名 × 矩形名）——
+    function obstacleIndex(analysis) {
+      var map = {};
+      analysis.obstacleConflicts.forEach(function (e) {
+        map[e.performerName + DIFF_KEY_SEP + e.obstacleName] = e;
+      });
+      return map;
+    }
+    var oiA = obstacleIndex(anA);
+    var oiB = obstacleIndex(anB);
+    var oKeys = Object.keys(oiA);
+    Object.keys(oiB).forEach(function (k) { if (oiA[k] === undefined) oKeys.push(k); });
+    oKeys.sort();
+
+    var obsNamesA = {};
+    normalizeObstacles(sceneA.obstacles).forEach(function (o) { obsNamesA[o.name] = true; });
+    var obsNamesB = {};
+    normalizeObstacles(sceneB.obstacles).forEach(function (o) { obsNamesB[o.name] = true; });
+
+    var obsDiff = { added: [], removed: [], changed: [], unchangedCount: 0 };
+    oKeys.forEach(function (key) {
+      var ea = oiA[key];
+      var eb = oiB[key];
+      if (!ea || !eb) return; // 表演者或矩形仅单侧存在：随增删名单列出
+      var parts = key.split(DIFF_KEY_SEP);
+      var item = { performerName: parts[0], obstacleName: parts[1] };
+      if (ea.conflict && eb.conflict) {
+        var dc = diffIntervalLists(ea.intervals, eb.intervals);
+        if (!dc.added.length && !dc.removed.length && !dc.changed.length) {
+          obsDiff.unchangedCount++;
+        } else {
+          obsDiff.changed.push(Object.assign({}, item, dc));
+        }
+      } else if (eb.conflict) {
+        obsDiff.added.push(Object.assign({}, item, { intervals: eb.intervals.map(function (iv) { return iv.slice(); }) }));
+      } else if (ea.conflict) {
+        obsDiff.removed.push(Object.assign({}, item, { intervals: ea.intervals.map(function (iv) { return iv.slice(); }) }));
+      }
+    });
+    obsDiff.added.sort(function (a, b) { return firstIvStart(a.intervals) - firstIvStart(b.intervals); });
+    obsDiff.removed.sort(function (a, b) { return firstIvStart(a.intervals) - firstIvStart(b.intervals); });
+    obsDiff.changed.sort(function (a, b) { return firstIvStart(flatNew(a)) - firstIvStart(flatNew(b)); });
+
+    return {
+      duration: T,
+      durationA: dA,
+      durationB: dB,
+      performers: performerDiffs,
+      maxOffset: globalMax ? globalMax.maxOffset : null,
+      maxOffsetT: globalMax ? globalMax.maxOffsetT : null,
+      maxOffsetPerformer: globalMax ? globalMax.name : null,
+      pairs: pairs,
+      obstacleIntrusions: obsDiff,
+      addedPerformers: namesB.filter(function (n) { return !nameSetA[n]; }),
+      removedPerformers: namesA.filter(function (n) { return !nameSetB[n]; }),
+      addedObstacles: Object.keys(obsNamesB).filter(function (n) { return !obsNamesA[n]; }).sort(),
+      removedObstacles: Object.keys(obsNamesA).filter(function (n) { return !obsNamesB[n]; }).sort()
+    };
+  }
+
   /**
    * 内置交叉样例（4 人，时长 12s，世界 1000×600）：
    *  - 甲（水平横穿）与乙（竖直纵穿）路径十字交叉，在 t=6 同时到达交点 -> 相撞
@@ -782,6 +1058,7 @@
     normalizeObstacles: normalizeObstacles,
     analyzeObstacle: analyzeObstacle,
     isPerformerInObstacle: isPerformerInObstacle,
+    compareScenes: compareScenes,
     builtinScene: builtinScene
   };
 });

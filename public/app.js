@@ -119,6 +119,7 @@
     renderObstacleResults();
     renderTimelineDanger();
     updatePlayhead();
+    refreshSnapshotDiff(); // 编辑场景后立即刷新方案对比
   }
 
   // ---------- 坐标换算 ----------
@@ -1500,6 +1501,435 @@
     draw();
   });
 
+  // ---------- 方案快照（localStorage 持久化，最多 8 个） ----------
+  var SNAP_KEY = 'trajectory-collision-stage.snapshots.v1';
+  var SNAP_LIMIT = 8;
+  var CURRENT_OPT = '__current__';
+
+  var snapSaveBtn = document.getElementById('btn-snap-save');
+  var snapNameInput = document.getElementById('snap-name');
+  var snapListEl = document.getElementById('snap-list');
+  var snapHeadEl = document.getElementById('snap-head');
+  var snapSelectA = document.getElementById('snap-select-a');
+  var snapSelectB = document.getElementById('snap-select-b');
+  var snapDiffEl = document.getElementById('snap-diff');
+  var snapStatusEl = document.getElementById('snap-status');
+  var snapStatusTimer = null;
+
+  // 深拷贝当前场景（状态中的 performer/obstacle 均为纯数据）
+  function serializeScene() {
+    return JSON.parse(JSON.stringify({
+      duration: state.duration,
+      performers: state.performers,
+      obstacles: state.obstacles
+    }));
+  }
+
+  function loadSnapshots() {
+    try {
+      var raw = window.localStorage.getItem(SNAP_KEY);
+      if (!raw) return [];
+      var parsed = JSON.parse(raw);
+      if (!parsed || !Array.isArray(parsed.list)) return [];
+      // 越限只保留最近 8 个
+      return parsed.list.slice(0, SNAP_LIMIT);
+    } catch (err) {
+      return [];
+    }
+  }
+
+  function persistSnapshots(list) {
+    try {
+      window.localStorage.setItem(SNAP_KEY, JSON.stringify({
+        version: 1,
+        selectA: snapSelectA.value || CURRENT_OPT,
+        selectB: snapSelectB.value || CURRENT_OPT,
+        list: list
+      }));
+    } catch (err) {
+      showSnapStatus('浏览器存储不可用，快照未能持久化', 'warn');
+    }
+  }
+
+  function readStoredSelection() {
+    try {
+      var raw = window.localStorage.getItem(SNAP_KEY);
+      if (!raw) return {};
+      var parsed = JSON.parse(raw);
+      return parsed || {};
+    } catch (err) {
+      return {};
+    }
+  }
+
+  var snapshots = loadSnapshots();
+  var stored = readStoredSelection();
+
+  function snapId() {
+    return 's' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+  }
+
+  function formatTime(ts) {
+    var d = new Date(ts);
+    function p(n) { return (n < 10 ? '0' : '') + n; }
+    return (d.getMonth() + 1) + '-' + p(d.getDate()) + ' ' + p(d.getHours()) + ':' + p(d.getMinutes());
+  }
+
+  function getSnapshot(id) {
+    return snapshots.find(function (s) { return s.id === id; }) || null;
+  }
+
+  function showSnapStatus(text, kind) {
+    snapStatusEl.hidden = false;
+    snapStatusEl.textContent = text;
+    snapStatusEl.className = 'snap-status ' + (kind || 'ok');
+    if (snapStatusTimer) clearTimeout(snapStatusTimer);
+    snapStatusTimer = setTimeout(function () { snapStatusEl.hidden = true; }, 2600);
+  }
+
+  function saveSnapshot() {
+    var name = snapNameInput.value.trim();
+    if (!name) {
+      showSnapStatus('请先填写快照名称（同名快照将被覆盖）', 'warn');
+      snapNameInput.focus();
+      return;
+    }
+    var existed = snapshots.find(function (s) { return s.name === name; });
+    if (existed) {
+      existed.scene = serializeScene();
+      existed.createdAt = Date.now();
+      // 覆盖后置顶（视为最新版本）
+      snapshots = snapshots.filter(function (s) { return s.id !== existed.id; });
+      snapshots.unshift(existed);
+      showSnapStatus('已覆盖同名快照「' + name + '」', 'ok');
+    } else {
+      if (snapshots.length >= SNAP_LIMIT) {
+        showSnapStatus('最多保留 ' + SNAP_LIMIT + ' 个快照：请删除或使用同名覆盖', 'warn');
+        return;
+      }
+      snapshots.unshift({ id: snapId(), name: name, scene: serializeScene(), createdAt: Date.now() });
+      showSnapStatus('已保存快照「' + name + '」', 'ok');
+    }
+    snapNameInput.value = '';
+    var newId = snapshots[0].id;
+    var autoSelectB = !existed && snapshots.length === 1;
+    persistSnapshots(snapshots);
+    renderSnapshotPanel(); // 先重建 <option>，再设置选中值
+    if (autoSelectB) {
+      // 首个快照：方案 2 默认取该快照，便于立即与当前场景对比
+      snapSelectB.value = newId;
+    }
+    persistSnapshots(snapshots);
+    refreshSnapshotDiff();
+  }
+
+  function deleteSnapshot(id) {
+    var s = getSnapshot(id);
+    snapshots = snapshots.filter(function (x) { return x.id !== id; });
+    if (snapSelectA.value === id) snapSelectA.value = CURRENT_OPT;
+    if (snapSelectB.value === id) snapSelectB.value = CURRENT_OPT;
+    persistSnapshots(snapshots);
+    renderSnapshotPanel();
+    refreshSnapshotDiff();
+    if (s) showSnapStatus('已删除快照「' + s.name + '」', 'ok');
+  }
+
+  function overwriteSnapshot(id) {
+    var s = getSnapshot(id);
+    if (!s) return;
+    s.scene = serializeScene();
+    s.createdAt = Date.now();
+    persistSnapshots(snapshots);
+    renderSnapshotPanel();
+    refreshSnapshotDiff();
+    showSnapStatus('已用当前场景覆盖快照「' + s.name + '」', 'ok');
+  }
+
+  function loadSnapshotScene(id) {
+    var s = getSnapshot(id);
+    if (!s) return;
+    loadScene(s.scene);
+    renderSnapshotPanel(); // loadScene 不影响快照，但同步选中态高亮
+    showSnapStatus('已载入快照「' + s.name + '」（可继续编辑，不会改动快照本身）', 'ok');
+  }
+
+  function renderSnapshotPanel() {
+    snapHeadEl.textContent = '方案快照（' + snapshots.length + '/' + SNAP_LIMIT + ' · 存于本机浏览器）';
+    snapSaveBtn.disabled = false; // 同名覆盖始终允许；满额时在保存处提示
+    snapNameInput.maxLength = 24;
+
+    // 快照列表
+    snapListEl.innerHTML = '';
+    if (!snapshots.length) {
+      var empty = document.createElement('div');
+      empty.className = 'snap-empty';
+      empty.textContent = '尚无快照：命名后点击「存为快照」，同名自动覆盖。';
+      snapListEl.appendChild(empty);
+    } else {
+      snapshots.forEach(function (s) {
+        var row = document.createElement('div');
+        row.className = 'snap-item';
+        var np = s.scene.performers ? s.scene.performers.length : 0;
+        var no = s.scene.obstacles ? s.scene.obstacles.length : 0;
+
+        var nameEl = document.createElement('span');
+        nameEl.className = 'snap-item-name';
+        nameEl.textContent = s.name;
+        nameEl.title = s.name;
+
+        var meta = document.createElement('span');
+        meta.className = 'snap-item-meta';
+        meta.textContent = s.scene.duration + 's · ' + np + '人' + (no ? ' · ' + no + '禁入' : '') +
+          ' · ' + formatTime(s.createdAt);
+
+        var loadBtn = document.createElement('button');
+        loadBtn.type = 'button';
+        loadBtn.className = 'snap-load';
+        loadBtn.textContent = '载入';
+        loadBtn.title = '把该快照载入舞台（不会修改快照）';
+        loadBtn.addEventListener('click', function (e) {
+          e.stopPropagation();
+          loadSnapshotScene(s.id);
+        });
+
+        var ovBtn = document.createElement('button');
+        ovBtn.type = 'button';
+        ovBtn.className = 'snap-overwrite';
+        ovBtn.textContent = '覆盖';
+        ovBtn.title = '用当前场景覆盖该快照';
+        ovBtn.addEventListener('click', function (e) {
+          e.stopPropagation();
+          overwriteSnapshot(s.id);
+        });
+
+        var delBtn = document.createElement('button');
+        delBtn.type = 'button';
+        delBtn.className = 'snap-del';
+        delBtn.textContent = '✕';
+        delBtn.title = '删除该快照';
+        delBtn.addEventListener('click', function (e) {
+          e.stopPropagation();
+          deleteSnapshot(s.id);
+        });
+
+        row.appendChild(nameEl);
+        row.appendChild(meta);
+        row.appendChild(loadBtn);
+        row.appendChild(ovBtn);
+        row.appendChild(delBtn);
+        snapListEl.appendChild(row);
+      });
+    }
+
+    // 两个对比选择器（都可选取"当前场景"）
+    [snapSelectA, snapSelectB].forEach(function (sel) {
+      var prev = sel.value;
+      sel.innerHTML = '';
+      var cur = document.createElement('option');
+      cur.value = CURRENT_OPT;
+      cur.textContent = '● 当前场景（实时）';
+      sel.appendChild(cur);
+      snapshots.forEach(function (s) {
+        var opt = document.createElement('option');
+        opt.value = s.id;
+        opt.textContent = '📷 ' + s.name;
+        sel.appendChild(opt);
+      });
+      sel.value = snapshots.some(function (s) { return s.id === prev; }) || prev === CURRENT_OPT
+        ? prev
+        : CURRENT_OPT;
+    });
+  }
+
+  function resolveCompareScene(value) {
+    if (value === CURRENT_OPT || value === '') {
+      return { label: '当前场景', scene: serializeScene(), live: true };
+    }
+    var s = getSnapshot(value);
+    return s ? { label: s.name, scene: s.scene, live: false } : null;
+  }
+
+  // 对比结果内任意时刻跳转（事件委托）
+  snapDiffEl.addEventListener('click', function (e) {
+    var el = e.target && typeof e.target.closest === 'function' ? e.target.closest('.t-jump') : null;
+    if (!el || !snapDiffEl.contains(el)) return;
+    var t = Number(el.getAttribute('data-t'));
+    if (isFinite(t)) seek(t);
+  });
+
+  function ivChip(iv, cls) {
+    return '<span class="diff-iv ' + cls + ' t-jump" data-t="' + iv[0] +
+      '" title="点击跳转到 ' + fmt(iv[0]) + 's">' +
+      fmt(iv[0]) + '–' + fmt(iv[1]) + ' s</span>';
+  }
+
+  function diffRowsHtml(items, kind, makeTitle) {
+    if (!items.length) return '';
+    var tagText = kind === 'added' ? '新增' : kind === 'removed' ? '消失' : '时间变化';
+    return items.map(function (it) {
+      var html = '<div class="diff-row">' +
+        '<span class="diff-tag ' + kind + '">' + tagText + '</span>' + makeTitle(it);
+      if (kind === 'added' || kind === 'removed') {
+        var jumpIv = it.intervals[0];
+        html += '<div class="diff-ivs">' +
+          (kind === 'added'
+            ? it.intervals.map(function (iv) { return ivChip(iv, 'new'); }).join('')
+            : it.intervals.map(function (iv) { return ivChip(iv, 'old'); }).join('')) +
+          (jumpIv ? ' <span class="t-jump" data-t="' + jumpIv[0] + '" title="点击跳转到该时刻">→ 跳转 ' +
+            fmt(jumpIv[0]) + 's</span>' : '') +
+          '</div>';
+      } else {
+        // 时间变化：旧区间（红）→ 新区间（绿）
+        var firstJump = null;
+        html += '<div class="diff-ivs">';
+        if (it.removed.length) {
+          html += it.removed.map(function (iv) { return ivChip(iv, 'old'); }).join('');
+          if (!firstJump) firstJump = it.removed[0];
+        }
+        if (it.changed.length) {
+          html += it.changed.map(function (c) {
+            if (!firstJump) firstJump = c.from;
+            return ivChip(c.from, 'old') + '<span class="diff-arrow">→</span>' + ivChip(c.to, 'new');
+          }).join('');
+        }
+        if (it.added.length) {
+          html += it.added.map(function (iv) { return ivChip(iv, 'new'); }).join('');
+          if (!firstJump) firstJump = it.added[0];
+        }
+        if (firstJump) {
+          html += ' <span class="t-jump" data-t="' + firstJump[0] +
+            '" title="点击跳转到该时刻">→ 跳转 ' + fmt(firstJump[0]) + 's</span>';
+        }
+        html += '</div>';
+      }
+      return html + '</div>';
+    }).join('');
+  }
+
+  function refreshSnapshotDiff() {
+    if (snapshots.length === 0 &&
+        snapSelectA.value === CURRENT_OPT && snapSelectB.value === CURRENT_OPT) {
+      snapDiffEl.innerHTML = '<div class="diff-empty">保存至少一个快照后，选择两个方案即可对比：位置偏移最大值、碰撞对与禁入区间的新增 / 消失 / 时间变化。</div>';
+      return;
+    }
+    var a = resolveCompareScene(snapSelectA.value);
+    var b = resolveCompareScene(snapSelectB.value);
+    if (!a || !b) {
+      snapDiffEl.innerHTML = '<div class="diff-empty">所选快照已不存在，请重新选择。</div>';
+      return;
+    }
+    if (snapSelectA.value === snapSelectB.value) {
+      snapDiffEl.innerHTML = '<div class="diff-empty">两个选择相同：把其中一个选为另一快照（或当前场景）后开始对比。</div>';
+      return;
+    }
+
+    var d;
+    try {
+      d = Core.compareScenes(a.scene, b.scene);
+    } catch (err) {
+      snapDiffEl.innerHTML = '<div class="diff-empty">对比失败：' + escapeHtml(err.message) + '</div>';
+      return;
+    }
+
+    var html = '';
+    if (Math.abs(d.durationA - d.durationB) > 1e-9) {
+      html += '<div class="diff-duration">总时长 ' + fmt(d.durationA, 1) + 's → ' +
+        fmt(d.durationB, 1) + 's，统一时刻轴 0～' + fmt(d.duration, 1) + 's（帧外按末位静止）</div>';
+    } else {
+      html += '<div class="diff-duration">统一时刻轴 0～' + fmt(d.duration, 1) + 's</div>';
+    }
+
+    // —— 同名表演者位置偏移 ——
+    var common = d.performers.filter(function (p) { return p.maxOffset !== null; });
+    var onlyA = d.performers.filter(function (p) { return !p.presentB; });
+    var onlyB = d.performers.filter(function (p) { return !p.presentA; });
+    html += '<div class="diff-section"><div class="diff-section-head">同名表演者位置偏移' +
+      '<span class="count">（线性插值 · 取统一时刻轴上的精确最大值）</span></div>';
+    if (d.maxOffset === null) {
+      html += '<div class="diff-empty">两方案没有同名表演者。</div>';
+    } else {
+      html += '<div class="diff-row diff-max-row">全局最大偏移 <b>' + fmt(d.maxOffset) +
+        '</b> 单位 · ' + escapeHtml(d.maxOffsetPerformer) +
+        ' @ <span class="t-jump" data-t="' + d.maxOffsetT + '" title="点击跳转到该时刻"><b>' +
+        fmt(d.maxOffsetT) + ' s</b></span></div>';
+      common.forEach(function (p) {
+        if (p.name === d.maxOffsetPerformer && Math.abs(p.maxOffset - d.maxOffset) < 1e-9) return;
+        html += '<div class="diff-row">' + escapeHtml(p.name) + '：偏移 <b>' + fmt(p.maxOffset) +
+          '</b> 单位 @ <span class="t-jump" data-t="' + p.maxOffsetT +
+          '" title="点击跳转到该时刻">' + fmt(p.maxOffsetT) + ' s</span></div>';
+      });
+    }
+    if (onlyA.length || onlyB.length) {
+      html += '<div class="diff-perf-only">';
+      if (onlyB.length) html += '方案 2 新增表演者：' + onlyB.map(function (p) { return escapeHtml(p.name); }).join('、');
+      if (onlyA.length) html += (onlyB.length ? '；' : '') + '方案 2 已移除：' +
+        onlyA.map(function (p) { return escapeHtml(p.name); }).join('、');
+      html += '</div>';
+    }
+    html += '</div>';
+
+    // —— 碰撞对 ——
+    var pr = d.pairs;
+    var prChanged = pr.added.length + pr.removed.length + pr.changed.length;
+    html += '<div class="diff-section"><div class="diff-section-head">碰撞对变化' +
+      '<span class="count">（' + prChanged + ' 项变化' +
+      (pr.unchangedCount ? ' · ' + pr.unchangedCount + ' 对区间不变' : '') + '）</span></div>';
+    if (!prChanged) {
+      html += '<div class="diff-empty">两方案的碰撞区间完全一致（无碰撞或区间未变）。</div>';
+    } else {
+      var pairTitle = function (it) {
+        return escapeHtml(it.names[0]) + ' <span style="color:var(--text-dim)">×</span> ' + escapeHtml(it.names[1]);
+      };
+      html += diffRowsHtml(pr.added, 'added', pairTitle);
+      html += diffRowsHtml(pr.removed, 'removed', pairTitle);
+      html += diffRowsHtml(pr.changed, 'changed', pairTitle);
+    }
+    html += '</div>';
+
+    // —— 禁入区间 ——
+    var ob = d.obstacleIntrusions;
+    var obChanged = ob.added.length + ob.removed.length + ob.changed.length;
+    html += '<div class="diff-section"><div class="diff-section-head">禁入区间变化' +
+      '<span class="count">（表演者 × 禁入区 · ' + obChanged + ' 项变化' +
+      (ob.unchangedCount ? ' · ' + ob.unchangedCount + ' 项不变' : '') + '）</span></div>';
+    if (!obChanged && !d.addedObstacles.length && !d.removedObstacles.length) {
+      html += '<div class="diff-empty">两方案的禁入区间完全一致。</div>';
+    } else {
+      var obsTitle = function (it) {
+        return escapeHtml(it.performerName) + ' <span style="color:var(--text-dim)">▣</span> ' + escapeHtml(it.obstacleName);
+      };
+      html += diffRowsHtml(ob.added, 'added', obsTitle);
+      html += diffRowsHtml(ob.removed, 'removed', obsTitle);
+      html += diffRowsHtml(ob.changed, 'changed', obsTitle);
+    }
+    if (d.addedObstacles.length || d.removedObstacles.length) {
+      html += '<div class="diff-perf-only">';
+      if (d.addedObstacles.length) html += '方案 2 新增禁入区：' + d.addedObstacles.map(escapeHtml).join('、');
+      if (d.removedObstacles.length) html += (d.addedObstacles.length ? '；' : '') + '方案 2 已删除禁入区：' +
+        d.removedObstacles.map(escapeHtml).join('、');
+      html += '</div>';
+    }
+    html += '</div>';
+
+    snapDiffEl.innerHTML = html;
+  }
+
+  snapSaveBtn.addEventListener('click', saveSnapshot);
+  snapNameInput.addEventListener('keydown', function (e) {
+    if (e.code === 'Enter') {
+      e.preventDefault();
+      saveSnapshot();
+    }
+  });
+  snapSelectA.addEventListener('change', function () {
+    persistSnapshots(snapshots);
+    refreshSnapshotDiff();
+  });
+  snapSelectB.addEventListener('change', function () {
+    persistSnapshots(snapshots);
+    refreshSnapshotDiff();
+  });
+
   // ---------- 启动 ----------
   function fetchSample() {
     fetch('/api/sample')
@@ -1514,5 +1944,15 @@
   }
 
   document.getElementById('duration-readout').textContent = state.duration.toFixed(1);
+  renderSnapshotPanel();
+  // 恢复上次选择的对比方案（已删除快照等失效值由 renderSnapshotPanel 钳为"当前场景"）
+  [['selectA', snapSelectA], ['selectB', snapSelectB]].forEach(function (pair) {
+    var key = pair[0];
+    var sel = pair[1];
+    if (stored[key] && (stored[key] === CURRENT_OPT || getSnapshot(stored[key]))) {
+      sel.value = stored[key];
+    }
+  });
+  refreshSnapshotDiff();
   fetchSample();
 })();

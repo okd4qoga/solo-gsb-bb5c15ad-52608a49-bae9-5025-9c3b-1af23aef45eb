@@ -100,6 +100,30 @@
         </div>
       </div>
 
+      <div class="panel panel-snapshots">
+        <div class="panel-head">
+          <span id="snap-head">方案快照（0/8 · 存于本机浏览器）</span>
+        </div>
+        <div class="snap-save">
+          <input id="snap-name" type="text" class="snap-name-input" maxlength="24" placeholder="快照名称，如：初稿" />
+          <button id="btn-snap-save" class="btn btn-mini btn-primary" title="同名快照直接覆盖">📷 存为快照</button>
+        </div>
+        <div id="snap-list" class="snap-list"></div>
+        <div class="snap-compare">
+          <div class="snap-slot">
+            <label>方案 1（基准）</label>
+            <select id="snap-select-a"></select>
+          </div>
+          <div class="snap-vs">⇄</div>
+          <div class="snap-slot">
+            <label>方案 2</label>
+            <select id="snap-select-b"></select>
+          </div>
+        </div>
+        <div id="snap-status" class="snap-status" hidden></div>
+        <div id="snap-diff" class="snap-diff"></div>
+      </div>
+
       <div class="panel panel-summary">
         <div class="summary-row">
           <div class="summary-item">

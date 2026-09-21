@@ -457,3 +457,201 @@ test('禁入区：单击画布投放默认尺寸矩形，Esc 取消新增模式'
   assert.equal(rows.length, 8);
   dom.window.close();
 });
+
+test('方案快照：保存（首个自动选为方案 2）、列表计数与 localStorage 持久化', async () => {
+  const dom = await boot();
+  const { window } = dom;
+  const doc = window.document;
+
+  // 初始：0/8，有空态提示，对比区为引导文案
+  assert.match(doc.getElementById('snap-head').textContent, /0\/8/);
+  assert.ok(doc.querySelector('.snap-empty'));
+  assert.match(doc.getElementById('snap-diff').textContent, /保存至少一个快照/);
+
+  const nameInput = doc.getElementById('snap-name');
+  nameInput.value = '初稿';
+  doc.getElementById('btn-snap-save').click();
+  await new Promise((r) => setTimeout(r, 10));
+
+  assert.match(doc.getElementById('snap-head').textContent, /1\/8/);
+  assert.equal(doc.querySelectorAll('.snap-item').length, 1);
+  // 首个快照自动进入方案 2 槽位，立即与"当前场景"对比
+  assert.notEqual(doc.getElementById('snap-select-b').value, '__current__');
+  assert.match(doc.getElementById('snap-diff').textContent, /全局最大偏移/);
+  // 状态提示
+  assert.match(doc.getElementById('snap-status').textContent, /已保存快照/);
+
+  // 已写入 localStorage（结构含 version/selectA/selectB/list）
+  const stored = JSON.parse(window.localStorage.getItem('trajectory-collision-stage.snapshots.v1'));
+  assert.equal(stored.version, 1);
+  assert.equal(stored.list.length, 1);
+  assert.equal(stored.list[0].name, '初稿');
+  assert.equal(stored.list[0].scene.performers.length, 4);
+  assert.equal(stored.list[0].scene.obstacles.length, 1);
+
+  // 不填名称：给出警告且不新增
+  nameInput.value = '';
+  doc.getElementById('btn-snap-save').click();
+  await new Promise((r) => setTimeout(r, 5));
+  assert.equal(doc.querySelectorAll('.snap-item').length, 1);
+  assert.match(doc.getElementById('snap-status').textContent, /请先填写快照名称/);
+  dom.window.close();
+});
+
+test('方案快照：同名覆盖不新增、异名最多 8 个', async () => {
+  const dom = await boot();
+  const { window } = dom;
+  const doc = window.document;
+  const nameInput = doc.getElementById('snap-name');
+
+  nameInput.value = 'v1';
+  doc.getElementById('btn-snap-save').click();
+  await new Promise((r) => setTimeout(r, 5));
+
+  // 同名覆盖：仍为 1 个，场景内容被更新
+  nameInput.value = 'v1';
+  doc.getElementById('btn-snap-save').click();
+  await new Promise((r) => setTimeout(r, 5));
+  assert.equal(doc.querySelectorAll('.snap-item').length, 1);
+  assert.match(doc.getElementById('snap-status').textContent, /已覆盖同名快照/);
+
+  for (let i = 2; i <= 8; i++) {
+    nameInput.value = 'v' + i;
+    doc.getElementById('btn-snap-save').click();
+    await new Promise((r) => setTimeout(r, 5));
+  }
+  assert.equal(doc.querySelectorAll('.snap-item').length, 8);
+
+  // 第 9 个异名快照被拒绝并提示
+  nameInput.value = 'v9';
+  doc.getElementById('btn-snap-save').click();
+  await new Promise((r) => setTimeout(r, 5));
+  assert.equal(doc.querySelectorAll('.snap-item').length, 8);
+  assert.match(doc.getElementById('snap-status').textContent, /最多保留 8 个/);
+
+  // 同名覆盖在满额时仍允许
+  nameInput.value = 'v1';
+  doc.getElementById('btn-snap-save').click();
+  await new Promise((r) => setTimeout(r, 5));
+  assert.equal(doc.querySelectorAll('.snap-item').length, 8);
+  dom.window.close();
+});
+
+test('方案快照：删除快照、行内覆盖按钮、载入快照', async () => {
+  const dom = await boot();
+  const { window } = dom;
+  const doc = window.document;
+  const nameInput = doc.getElementById('snap-name');
+
+  nameInput.value = '甲案';
+  doc.getElementById('btn-snap-save').click();
+  await new Promise((r) => setTimeout(r, 5));
+
+  // 行内覆盖
+  const item = doc.querySelector('.snap-item');
+  item.querySelector('.snap-overwrite').click();
+  await new Promise((r) => setTimeout(r, 5));
+  assert.match(doc.getElementById('snap-status').textContent, /覆盖快照/);
+
+  // 改动舞台后载入快照：回到快照场景（4 人）
+  doc.getElementById('btn-add').click();
+  assert.equal(doc.querySelectorAll('.performer-item').length, 5);
+  item.querySelector('.snap-load').click();
+  await new Promise((r) => setTimeout(r, 10));
+  assert.equal(doc.querySelectorAll('.performer-item').length, 4, '载入快照恢复为 4 人');
+  assert.match(doc.getElementById('snap-status').textContent, /已载入快照/);
+
+  // 删除
+  item.querySelector('.snap-del').click();
+  await new Promise((r) => setTimeout(r, 5));
+  assert.equal(doc.querySelectorAll('.snap-item').length, 0);
+  assert.match(doc.getElementById('snap-head').textContent, /0\/8/);
+  // 对比槽位回到"当前场景"，引导文案恢复
+  assert.equal(doc.getElementById('snap-select-b').value, '__current__');
+  assert.match(doc.getElementById('snap-diff').textContent, /保存至少一个快照/);
+  const stored = JSON.parse(window.localStorage.getItem('trajectory-collision-stage.snapshots.v1'));
+  assert.equal(stored.list.length, 0);
+  dom.window.close();
+});
+
+test('方案快照：编辑场景立即刷新对比，点击结果时刻跳转播放头', async () => {
+  const dom = await boot();
+  const { window } = dom;
+  const doc = window.document;
+  const canvas = doc.getElementById('stage');
+
+  function pointer(type, x, y) {
+    canvas.dispatchEvent(new window.MouseEvent(type, {
+      bubbles: true, cancelable: true, clientX: x, clientY: y, button: 0
+    }));
+  }
+
+  doc.getElementById('snap-name').value = '初稿';
+  doc.getElementById('btn-snap-save').click();
+  await new Promise((r) => setTimeout(r, 10));
+  const diffEl = doc.getElementById('snap-diff');
+
+  // 刚保存（场景未改）：偏移为 0
+  assert.match(diffEl.textContent, /全局最大偏移\s*0\.00/);
+
+  // 拖动甲首帧 (60,300) -> (160,300)：对比立即更新（无需重新选择）
+  pointer('pointerdown', 60, 300);
+  pointer('pointermove', 160, 300);
+  pointer('pointerup', 160, 300);
+  await new Promise((r) => setTimeout(r, 10));
+
+  assert.match(diffEl.textContent, /全局最大偏移\s*100\.00/);
+  // 碰撞对变化区块出现"新增/消失/时间变化"之一
+  const sections = [...diffEl.querySelectorAll('.diff-section')];
+  assert.equal(sections.length, 3, '偏移 / 碰撞对 / 禁入区 三个区块');
+  assert.match(sections[1].textContent, /碰撞对变化/);
+  assert.match(sections[2].textContent, /禁入区间变化/);
+
+  // 点击全局最大偏移时刻：播放头跳到该时刻（t=0）
+  const maxJump = diffEl.querySelector('.diff-max-row .t-jump');
+  assert.ok(maxJump);
+  maxJump.dispatchEvent(new window.MouseEvent('click', { bubbles: true }));
+  assert.equal(Number(doc.getElementById('time-input').value), 0);
+
+  // 点击碰撞对区块中的某个时刻跳转元素
+  doc.getElementById('time-input').value = '9';
+  doc.getElementById('time-input').dispatchEvent(new window.Event('change', { bubbles: true }));
+  const pairJump = sections[1].querySelector('.t-jump');
+  const expected = Number(pairJump.getAttribute('data-t'));
+  pairJump.dispatchEvent(new window.MouseEvent('click', { bubbles: true }));
+  const tv = Number(doc.getElementById('time-input').value);
+  assert.ok(Math.abs(tv - expected) < 0.01, `播放头应跳到 ${expected}，实际 ${tv}`);
+  dom.window.close();
+});
+
+test('方案快照：两个槽位都选快照时按快照内容对比，相同选择给出提示', async () => {
+  const dom = await boot();
+  const { window } = dom;
+  const doc = window.document;
+  const nameInput = doc.getElementById('snap-name');
+  const selA = doc.getElementById('snap-select-a');
+  const selB = doc.getElementById('snap-select-b');
+
+  nameInput.value = 's1';
+  doc.getElementById('btn-snap-save').click();
+  await new Promise((r) => setTimeout(r, 5));
+  const id1 = selB.value;
+  nameInput.value = 's2';
+  doc.getElementById('btn-snap-save').click();
+  await new Promise((r) => setTimeout(r, 5));
+  assert.equal(doc.querySelectorAll('.snap-item').length, 2);
+
+  // 两槽位选同一快照：提示文案，不计算
+  selA.value = id1;
+  selA.dispatchEvent(new window.Event('change', { bubbles: true }));
+  selB.value = id1;
+  selB.dispatchEvent(new window.Event('change', { bubbles: true }));
+  assert.match(doc.getElementById('snap-diff').textContent, /两个选择相同/);
+
+  // 改为两个不同快照：恢复正常对比（快照未改动 → 偏移为 0）
+  const id2 = [...selB.options].map((o) => o.value).find((v) => v !== id1 && v !== '__current__');
+  selB.value = id2;
+  selB.dispatchEvent(new window.Event('change', { bubbles: true }));
+  assert.match(doc.getElementById('snap-diff').textContent, /全局最大偏移\s*0\.00/);
+  dom.window.close();
+});
