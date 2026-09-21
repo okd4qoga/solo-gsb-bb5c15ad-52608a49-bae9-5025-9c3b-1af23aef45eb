@@ -100,6 +100,34 @@
         </div>
       </div>
 
+      <div class="panel panel-snapshots">
+        <div class="panel-head">
+          <span>方案快照（本机保存 · 最多 8 个）</span>
+        </div>
+        <div class="snap-save">
+          <input id="snap-name" type="text" maxlength="24" placeholder="快照名称，如 初排v1" />
+          <button id="btn-snap-save" class="btn btn-mini btn-primary" type="button" title="把当前场景保存为命名快照（同名覆盖）">保存</button>
+        </div>
+        <div id="snap-msg" class="snap-msg" hidden></div>
+        <div id="snapshot-list" class="snapshot-list"></div>
+
+        <div class="snap-diff-head">
+          <span>方案对比（统一时刻轴）</span>
+        </div>
+        <div class="snap-selectors">
+          <label class="snap-sel">
+            <span class="snap-tag tag-a">A 基准</span>
+            <select id="snap-slot-a"></select>
+          </label>
+          <label class="snap-sel">
+            <span class="snap-tag tag-b">B 对比</span>
+            <select id="snap-slot-b"></select>
+          </label>
+        </div>
+        <div id="snap-diff-hint" class="snap-diff-hint">选择两个快照（或"当前场景"）后显示差异；当前场景被编辑时立即刷新。</div>
+        <div id="snap-diff" class="snap-diff" hidden></div>
+      </div>
+
       <div class="panel panel-summary">
         <div class="summary-row">
           <div class="summary-item">

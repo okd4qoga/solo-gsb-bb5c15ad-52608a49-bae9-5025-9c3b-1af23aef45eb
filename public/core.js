@@ -714,6 +714,262 @@
    *  - 中央禁入矩形覆盖十字交点：甲、乙按实时安全半径先后进入（演示禁入区分析），
    *    丙、丁错峰折线从对角掠过，不侵入
    */
+  // ---------- 方案快照对比 ----------
+  //
+  // 两个场景按"统一时刻轴"对比：取两者 duration 的最大值 T，同名表演者
+  // （按 name 配对；场景内重名取首个）在同一时刻 t 的位置各自按其关键帧
+  // 分段线性插值（关键帧之外保持端点静止，与主模型一致）。
+  //
+  // 最大位置偏移精确求解：差向量 Δp(t)=pA(t)−pB(t) 在两人关键帧时刻并集
+  // 切出的每个子区间内是 t 的一次函数，|Δp(t)| 为凸函数，故区间最大值必在
+  // 子区间端点——只需比较全体关键帧时刻（含 0、T）上的取值，无采样搜索。
+  //
+  // 碰撞对按"表演者名 × 表演者名"配对，禁入侵入区间按"表演者名 × 禁入区名"
+  // 配对，双方区间（已合并）逐一比较，分类为 added（B 有 A 无）/
+  // removed（A 有 B 无）/ changed（双方都有但时刻不同）/ unchanged。
+  // 禁入区整体只存在于一侧时，其中的侵入区间按新增/消失计入。
+
+  var DIFF_TOL = 1e-6; // 区间时刻相等的判定容差（秒，带相对放大）
+
+  function firstByName(list) {
+    var map = Object.create(null);
+    (list || []).forEach(function (x) {
+      var key = String(x.name);
+      if (!(key in map)) map[key] = x;
+    });
+    return map;
+  }
+
+  /** 两组已合并区间是否逐端点相等（容差随时刻尺度放大）。 */
+  function intervalsEqualAs(ivsA, ivsB) {
+    if (ivsA.length !== ivsB.length) return false;
+    for (var i = 0; i < ivsA.length; i++) {
+      var scale = Math.max(1,
+        Math.abs(ivsA[i][0]), Math.abs(ivsA[i][1]),
+        Math.abs(ivsB[i][0]), Math.abs(ivsB[i][1]));
+      var tol = DIFF_TOL * scale;
+      if (Math.abs(ivsA[i][0] - ivsB[i][0]) > tol) return false;
+      if (Math.abs(ivsA[i][1] - ivsB[i][1]) > tol) return false;
+    }
+    return true;
+  }
+
+  /** 两条分段线性轨迹在 [0,T] 上的最大位置偏移及发生时刻（解析精确，见节首说明）。 */
+  function maxPositionOffset(keysA, keysB, T) {
+    var ksA = normalizeKeys(keysA);
+    var ksB = normalizeKeys(keysB);
+    var set = Object.create(null);
+    [0, T].forEach(function (t) { set[t] = true; });
+    ksA.forEach(function (k) { if (k.t >= 0 && k.t <= T) set[k.t] = true; });
+    ksB.forEach(function (k) { if (k.t >= 0 && k.t <= T) set[k.t] = true; });
+    var times = Object.keys(set).map(Number).sort(function (a, b) { return a - b; });
+    var best = 0;
+    var bestT = 0;
+    times.forEach(function (t) {
+      var pa = positionAt(ksA, t);
+      var pb = positionAt(ksB, t);
+      var d = Math.hypot(pa.x - pb.x, pa.y - pb.y);
+      if (d > best) {
+        best = d;
+        bestT = t;
+      }
+    });
+    return { offset: best, t: bestT };
+  }
+
+  function pairIndex(analysis) {
+    var m = Object.create(null);
+    analysis.pairs.forEach(function (p) {
+      m[p.aId + '||' + p.bId] = p;
+      m[p.bId + '||' + p.aId] = p;
+    });
+    return m;
+  }
+
+  function conflictIndex(analysis) {
+    var m = Object.create(null);
+    analysis.obstacleConflicts.forEach(function (e) {
+      m[e.performerId + '||' + e.obstacleId] = e;
+    });
+    return m;
+  }
+
+  function intervalChangeKind(ivsA, ivsB) {
+    var ca = ivsA.length > 0;
+    var cb = ivsB.length > 0;
+    if (!ca && cb) return 'added';
+    if (ca && !cb) return 'removed';
+    if (ca && cb) return intervalsEqualAs(ivsA, ivsB) ? 'unchanged' : 'changed';
+    return 'none';
+  }
+
+  var DIFF_KIND_RANK = { added: 0, removed: 1, changed: 2, unchanged: 3, none: 4 };
+
+  function sortChanges(list) {
+    list.sort(function (x, y) {
+      if (x.kind !== y.kind) return DIFF_KIND_RANK[x.kind] - DIFF_KIND_RANK[y.kind];
+      var tx = x.kind === 'removed' ? x.firstA : x.firstB;
+      var ty = y.kind === 'removed' ? y.firstA : y.firstB;
+      if (tx === null) tx = x.firstA;
+      if (ty === null) ty = y.firstA;
+      if (Math.abs((tx || 0) - (ty || 0)) > 1e-9) return (tx || 0) - (ty || 0);
+      var kx = (x.nameA || '') + '|' + (x.nameB || x.obstacleName || '');
+      var ky = (y.nameA || '') + '|' + (y.nameB || y.obstacleName || '');
+      return kx < ky ? -1 : kx > ky ? 1 : 0;
+    });
+  }
+
+  /**
+   * 对比两个场景（方案快照）。入参与 analyzeScene 同形。
+   * 返回 {
+   *   durationA, durationB, T,                 // 统一时刻轴 = max(duration)
+   *   matchedPerformers: [{name,maxOffset,maxOffsetT}],  // 同名表演者（按偏移降序）
+   *   performersOnlyA, performersOnlyB,        // 仅一侧存在的表演者名
+   *   obstaclesOnlyA, obstaclesOnlyB,          // 仅一侧存在的禁入区名
+   *   pairChanges: [{kind,nameA,nameB,intervalsA,intervalsB,firstA,firstB}],
+   *   obstacleChanges:
+   *     [{kind,performerName,obstacleName,intervalsA,intervalsB,firstA,firstB}]
+   * }
+   * kind: 'added'（B 新增）/ 'removed'（B 消失）/ 'changed'（时刻变化）/
+   *       'unchanged'（双方相同）；两侧均无碰撞/侵入的组合不输出。
+   */
+  function diffScenes(sceneA, sceneB) {
+    var durA = Number(sceneA.duration);
+    var durB = Number(sceneB.duration);
+    if (!(durA > 0) || !(durB > 0)) throw new Error('duration 必须为正数');
+    var anA = analyzeScene(sceneA);
+    var anB = analyzeScene(sceneB);
+    var T = Math.max(durA, durB);
+
+    var paMap = firstByName(sceneA.performers);
+    var pbMap = firstByName(sceneB.performers);
+    var oaMap = firstByName(anA.obstacles);
+    var obMap = firstByName(anB.obstacles);
+
+    var allNames = {};
+    Object.keys(paMap).forEach(function (n) { allNames[n] = true; });
+    Object.keys(pbMap).forEach(function (n) { allNames[n] = true; });
+
+    // —— 同名表演者：精确最大位置偏移 ——
+    var matched = [];
+    var performersOnlyA = [];
+    var performersOnlyB = [];
+    Object.keys(allNames).sort().forEach(function (name) {
+      var pa = paMap[name];
+      var pb = pbMap[name];
+      if (pa && pb) {
+        var mo = maxPositionOffset(pa.keys, pb.keys, T);
+        matched.push({ name: name, maxOffset: mo.offset, maxOffsetT: mo.t });
+      } else if (pa) {
+        performersOnlyA.push(name);
+      } else {
+        performersOnlyB.push(name);
+      }
+    });
+    matched.sort(function (x, y) {
+      if (y.maxOffset !== x.maxOffset) return y.maxOffset - x.maxOffset;
+      return x.name < y.name ? -1 : x.name > y.name ? 1 : 0;
+    });
+
+    var common = Object.keys(allNames).filter(function (n) {
+      return paMap[n] && pbMap[n];
+    }).sort();
+
+    // —— 碰撞对：同名组合逐一配对比较 ——
+    var piA = pairIndex(anA);
+    var piB = pairIndex(anB);
+    var pairChanges = [];
+    for (var i = 0; i < common.length; i++) {
+      for (var j = i + 1; j < common.length; j++) {
+        var na = common[i];
+        var nb = common[j];
+        var qa = piA[paMap[na].id + '||' + paMap[nb].id];
+        var qb = piB[pbMap[na].id + '||' + pbMap[nb].id];
+        var ivsA = qa ? qa.intervals : [];
+        var ivsB = qb ? qb.intervals : [];
+        var kind = intervalChangeKind(ivsA, ivsB);
+        if (kind === 'none') continue;
+        pairChanges.push({
+          kind: kind,
+          nameA: na,
+          nameB: nb,
+          intervalsA: ivsA,
+          intervalsB: ivsB,
+          firstA: ivsA.length ? ivsA[0][0] : null,
+          firstB: ivsB.length ? ivsB[0][0] : null
+        });
+      }
+    }
+    sortChanges(pairChanges);
+
+    // —— 禁入侵入区间：同名表演者 × 同名禁入区配对比较 ——
+    var ciA = conflictIndex(anA);
+    var ciB = conflictIndex(anB);
+    var obstacleChanges = [];
+    var obstacleNames = {};
+    Object.keys(oaMap).forEach(function (n) { obstacleNames[n] = true; });
+    Object.keys(obMap).forEach(function (n) { obstacleNames[n] = true; });
+    var obstaclesOnlyA = [];
+    var obstaclesOnlyB = [];
+
+    function pushObstacleChange(kind, pName, oAName, oBName, eA, eB) {
+      var ivsA = eA ? eA.intervals : [];
+      var ivsB = eB ? eB.intervals : [];
+      obstacleChanges.push({
+        kind: kind,
+        performerName: pName,
+        obstacleName: oBName || oAName,
+        intervalsA: ivsA,
+        intervalsB: ivsB,
+        firstA: ivsA.length ? ivsA[0][0] : null,
+        firstB: ivsB.length ? ivsB[0][0] : null
+      });
+    }
+
+    common.forEach(function (pName) {
+      var pa = paMap[pName];
+      var pb = pbMap[pName];
+      Object.keys(obstacleNames).sort().forEach(function (oName) {
+        var oa = oaMap[oName];
+        var ob = obMap[oName];
+        if (oa && ob) {
+          var kind = intervalChangeKind(
+            ciA[pa.id + '||' + oa.id] ? ciA[pa.id + '||' + oa.id].intervals : [],
+            ciB[pb.id + '||' + ob.id] ? ciB[pb.id + '||' + ob.id].intervals : []
+          );
+          if (kind === 'none') return;
+          pushObstacleChange(kind, pName, oName, oName,
+            ciA[pa.id + '||' + oa.id], ciB[pb.id + '||' + ob.id]);
+        } else if (ob) {
+          // 禁入区仅 B 有：其中对该同名表演者的侵入即 B 的新增区间
+          var eB = ciB[pb.id + '||' + ob.id];
+          if (eB && eB.conflict) pushObstacleChange('added', pName, null, oName, null, eB);
+        } else if (oa) {
+          var eA = ciA[pa.id + '||' + oa.id];
+          if (eA && eA.conflict) pushObstacleChange('removed', pName, oName, null, eA, null);
+        }
+      });
+    });
+    Object.keys(obstacleNames).sort().forEach(function (n) {
+      if (oaMap[n] && !obMap[n]) obstaclesOnlyA.push(n);
+      if (obMap[n] && !oaMap[n]) obstaclesOnlyB.push(n);
+    });
+    sortChanges(obstacleChanges);
+
+    return {
+      durationA: durA,
+      durationB: durB,
+      T: T,
+      matchedPerformers: matched,
+      performersOnlyA: performersOnlyA,
+      performersOnlyB: performersOnlyB,
+      obstaclesOnlyA: obstaclesOnlyA,
+      obstaclesOnlyB: obstaclesOnlyB,
+      pairChanges: pairChanges,
+      obstacleChanges: obstacleChanges
+    };
+  }
+
   function builtinScene() {
     return {
       duration: 12,
@@ -782,6 +1038,8 @@
     normalizeObstacles: normalizeObstacles,
     analyzeObstacle: analyzeObstacle,
     isPerformerInObstacle: isPerformerInObstacle,
+    diffScenes: diffScenes,
+    maxPositionOffset: maxPositionOffset,
     builtinScene: builtinScene
   };
 });

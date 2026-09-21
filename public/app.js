@@ -10,6 +10,9 @@
   var KEY_HIT_PX = 9;      // 走位点命中半径（屏幕像素）
   var TICK_HIT_PX = 7;     // 时间轴时刻柄命中半径
   var NEW_OBS_SIZE = 120;  // 单击画布新增禁入矩形的默认边长
+  var SNAP_LS_KEY = 'trajectory-stage:snapshots:v1'; // localStorage 键
+  var SNAP_LIMIT = 8;      // 最多保留 8 个命名快照
+  var LIVE = '__live__';   // 对比槽位选择"当前场景"的特殊值
 
   var canvas = document.getElementById('stage');
   var ctx = canvas.getContext('2d');
@@ -29,7 +32,11 @@
     speed: 1,
     analysis: null,
     activePairKey: null,    // 结果面板选中的双人对
-    drag: null              // 画布/时间轴拖拽上下文
+    drag: null,             // 画布/时间轴拖拽上下文
+    snapshots: [],          // 方案快照（localStorage 持久化）
+    slotA: LIVE,            // 对比槽位 A（快照 id 或 LIVE 当前场景）
+    slotB: LIVE,            // 对比槽位 B
+    diffSig: null           // 上一次差异渲染的输入签名（场景内容未变则跳过重绘）
   };
 
   function uid() {
@@ -119,6 +126,7 @@
     renderObstacleResults();
     renderTimelineDanger();
     updatePlayhead();
+    refreshSnapshotDiff();   // 编辑场景后立即刷新方案对比（槽位含"当前场景"时）
   }
 
   // ---------- 坐标换算 ----------
@@ -1500,6 +1508,453 @@
     draw();
   });
 
+  // ---------- 方案快照（localStorage 持久化 + 两方案对比） ----------
+  var snapListEl = document.getElementById('snapshot-list');
+  var snapNameInput = document.getElementById('snap-name');
+  var snapMsgEl = document.getElementById('snap-msg');
+  var slotAEl = document.getElementById('snap-slot-a');
+  var slotBEl = document.getElementById('snap-slot-b');
+  var snapDiffEl = document.getElementById('snap-diff');
+  var snapDiffHintEl = document.getElementById('snap-diff-hint');
+  var snapMsgTimer = null;
+
+  function snapUid() {
+    return 's' + Math.random().toString(36).slice(2, 9) + Date.now().toString(36);
+  }
+
+  /** 序列化当前编辑场景为纯数据快照（不保留 UI 选择状态）。 */
+  function serializeScene() {
+    return {
+      duration: state.duration,
+      performers: state.performers.map(function (p) {
+        return {
+          id: p.id,
+          name: p.name,
+          color: p.color,
+          radius: p.radius,
+          keys: p.keys.map(function (k) {
+            return { t: k.t, x: k.x, y: k.y, r: k.r === undefined ? null : k.r };
+          })
+        };
+      }),
+      obstacles: state.obstacles.map(function (o) {
+        return { id: o.id, name: o.name, x: o.x, y: o.y, width: o.width, height: o.height };
+      })
+    };
+  }
+
+  // ---- localStorage 读写（隐私模式/配额失败时降级为仅内存） ----
+  function loadSnapshots() {
+    try {
+      var raw = window.localStorage.getItem(SNAP_LS_KEY);
+      if (!raw) return [];
+      var arr = JSON.parse(raw);
+      if (!Array.isArray(arr)) return [];
+      return arr.filter(function (s) {
+        return s && typeof s.name === 'string' && s.scene && isFinite(Number(s.scene.duration));
+      });
+    } catch (e) {
+      return [];
+    }
+  }
+
+  function persistSnapshots() {
+    try {
+      window.localStorage.setItem(SNAP_LS_KEY, JSON.stringify(state.snapshots));
+    } catch (e) {
+      showSnapMsg('浏览器存储不可用，快照仅保留在本次会话', true);
+    }
+  }
+
+  function getSnapshot(id) {
+    return state.snapshots.find(function (s) { return s.id === id; }) || null;
+  }
+
+  function showSnapMsg(text, warn) {
+    snapMsgEl.textContent = text;
+    snapMsgEl.classList.toggle('warn', !!warn);
+    snapMsgEl.hidden = false;
+    if (snapMsgTimer) clearTimeout(snapMsgTimer);
+    snapMsgTimer = setTimeout(function () { snapMsgEl.hidden = true; }, 3200);
+  }
+
+  function formatSnapTime(ts) {
+    var d = new Date(ts);
+    function p2(n) { return (n < 10 ? '0' : '') + n; }
+    return (d.getMonth() + 1) + '-' + p2(d.getDate()) + ' ' + p2(d.getHours()) + ':' + p2(d.getMinutes());
+  }
+
+  function saveSnapshot(overwriteId) {
+    // 显式覆盖某快照：直接用当前场景替换，不依赖名称输入框
+    if (overwriteId) {
+      var ov0 = getSnapshot(overwriteId);
+      if (ov0) {
+        ov0.scene = serializeScene();
+        ov0.savedAt = Date.now();
+        persistSnapshots();
+        renderSnapshotList();
+        refreshSnapshotDiff();
+        showSnapMsg('已覆盖快照「' + ov0.name + '」');
+      }
+      return;
+    }
+
+    var name = snapNameInput.value.trim();
+    if (!name) {
+      showSnapMsg('请先填写快照名称', true);
+      snapNameInput.focus();
+      return;
+    }
+    var existing = state.snapshots.find(function (s) { return s.name === name; });
+    if (existing) {
+      // 同名即覆盖（需求支持覆盖）
+      existing.scene = serializeScene();
+      existing.savedAt = Date.now();
+      persistSnapshots();
+      renderSnapshotList();
+      renderSlotSelectors();
+      refreshSnapshotDiff();
+      snapNameInput.value = '';
+      showSnapMsg('已覆盖同名快照「' + name + '」');
+      return;
+    }
+    if (state.snapshots.length >= SNAP_LIMIT) {
+      showSnapMsg('最多保留 ' + SNAP_LIMIT + ' 个快照，请先删除或覆盖旧快照', true);
+      return;
+    }
+    var rec = { id: snapUid(), name: name, savedAt: Date.now(), scene: serializeScene() };
+    state.snapshots.push(rec);
+    persistSnapshots();
+    // 最早保存的两个快照在槽位仍为"当前场景"时依次自动填入 A、B（尊重用户手动选择）
+    if (state.snapshots.length <= 2) {
+      var saved = state.snapshots.slice().sort(function (a, b) { return a.savedAt - b.savedAt; });
+      if (state.snapshots.length === 1) state.slotA = saved[0].id;
+      if (state.snapshots.length === 2) {
+        if (state.slotA === LIVE) state.slotA = saved[0].id;
+        if (state.slotB === LIVE) state.slotB = saved[1].id;
+      }
+    }
+    snapNameInput.value = '';
+    renderSnapshotList();
+    renderSlotSelectors();
+    refreshSnapshotDiff();
+    showSnapMsg('已保存快照「' + name + '」');
+  }
+
+  function deleteSnapshot(id) {
+    var s = getSnapshot(id);
+    state.snapshots = state.snapshots.filter(function (x) { return x.id !== id; });
+    if (state.slotA === id) state.slotA = LIVE;
+    if (state.slotB === id) state.slotB = LIVE;
+    persistSnapshots();
+    renderSnapshotList();
+    renderSlotSelectors();
+    refreshSnapshotDiff();
+    if (s) showSnapMsg('已删除快照「' + s.name + '」');
+  }
+
+  function loadSnapshot(id) {
+    var s = getSnapshot(id);
+    if (!s) return;
+    loadScene(s.scene, { keepTime: false });
+    renderSnapshotList();
+    showSnapMsg('已载入快照「' + s.name + '」，可在画布继续编辑');
+  }
+
+  // ---- 快照列表渲染 ----
+  function renderSnapshotList() {
+    snapListEl.innerHTML = '';
+    if (!state.snapshots.length) {
+      var empty = document.createElement('div');
+      empty.className = 'snap-empty';
+      empty.textContent = '尚无快照：编辑好场景后命名并保存。';
+      snapListEl.appendChild(empty);
+    } else {
+      // 新保存的排前面
+      state.snapshots.slice().sort(function (a, b) { return b.savedAt - a.savedAt; })
+        .forEach(function (s) {
+          var row = document.createElement('div');
+          row.className = 'snap-row';
+          if (state.slotA === s.id) row.classList.add('used-a');
+          if (state.slotB === s.id) row.classList.add('used-b');
+
+          var badges = document.createElement('div');
+          badges.className = 'snap-badges';
+          if (state.slotA === s.id) {
+            var ba = document.createElement('span');
+            ba.className = 'snap-badge a';
+            ba.textContent = 'A';
+            badges.appendChild(ba);
+          }
+          if (state.slotB === s.id) {
+            var bb = document.createElement('span');
+            bb.className = 'snap-badge b';
+            bb.textContent = 'B';
+            badges.appendChild(bb);
+          }
+
+          var meta = document.createElement('div');
+          meta.className = 'snap-meta';
+          var nm = document.createElement('div');
+          nm.className = 'snap-name';
+          nm.textContent = s.name;
+          nm.title = s.name + ' · ' + s.scene.performers.length + ' 人 · ' +
+            s.scene.duration + 's · ' + (s.scene.obstacles ? s.scene.obstacles.length : 0) + ' 禁入区';
+          var tm = document.createElement('div');
+          tm.className = 'snap-time';
+          tm.textContent = formatSnapTime(s.savedAt) + ' · ' + s.scene.performers.length +
+            ' 人 · ' + s.scene.duration + 's';
+          meta.appendChild(nm);
+          meta.appendChild(tm);
+
+          var ops = document.createElement('div');
+          ops.className = 'snap-ops';
+          var btnLoad = document.createElement('button');
+          btnLoad.type = 'button';
+          btnLoad.textContent = '载入';
+          btnLoad.title = '用该快照替换当前舞台场景';
+          btnLoad.addEventListener('click', function (e) {
+            e.stopPropagation();
+            loadSnapshot(s.id);
+          });
+          var btnOv = document.createElement('button');
+          btnOv.type = 'button';
+          btnOv.textContent = '覆盖';
+          btnOv.title = '用当前场景内容覆盖该快照';
+          btnOv.addEventListener('click', function (e) {
+            e.stopPropagation();
+            saveSnapshot(s.id);
+          });
+          var btnDel = document.createElement('button');
+          btnDel.type = 'button';
+          btnDel.className = 'snap-del';
+          btnDel.textContent = '删除';
+          btnDel.title = '删除该快照';
+          btnDel.addEventListener('click', function (e) {
+            e.stopPropagation();
+            deleteSnapshot(s.id);
+          });
+          ops.appendChild(btnLoad);
+          ops.appendChild(btnOv);
+          ops.appendChild(btnDel);
+
+          row.appendChild(badges);
+          row.appendChild(meta);
+          row.appendChild(ops);
+          snapListEl.appendChild(row);
+        });
+    }
+    document.getElementById('btn-snap-save').disabled =
+      state.snapshots.length >= SNAP_LIMIT && !snapNameInput.value.trim();
+  }
+
+  // ---- A / B 槽位选择 ----
+  function renderSlotSelectors() {
+    [slotAEl, slotBEl].forEach(function (sel) {
+      // 以 state 为准（重建 option 前 DOM 旧值不可信）
+      var cur = sel === slotAEl ? state.slotA : state.slotB;
+      sel.innerHTML = '';
+      var liveOpt = document.createElement('option');
+      liveOpt.value = LIVE;
+      liveOpt.textContent = '当前场景（实时）';
+      sel.appendChild(liveOpt);
+      state.snapshots.slice().sort(function (a, b) { return b.savedAt - a.savedAt; })
+        .forEach(function (s) {
+          var opt = document.createElement('option');
+          opt.value = s.id;
+          opt.textContent = s.name;
+          sel.appendChild(opt);
+        });
+      sel.value = cur;
+    });
+    renderSnapshotList();
+  }
+
+  function slotScene(slotId) {
+    if (slotId === LIVE) return serializeScene();
+    var s = getSnapshot(slotId);
+    return s ? s.scene : null;
+  }
+
+  function slotLabel(slotId) {
+    if (slotId === LIVE) return '当前场景';
+    var s = getSnapshot(slotId);
+    return s ? s.name : '（已删除）';
+  }
+
+  slotAEl.addEventListener('change', function () {
+    state.slotA = slotAEl.value;
+    state.diffSig = null; // 槽位变化强制重渲
+    renderSnapshotList();
+    refreshSnapshotDiff();
+  });
+  slotBEl.addEventListener('change', function () {
+    state.slotB = slotBEl.value;
+    state.diffSig = null;
+    renderSnapshotList();
+    refreshSnapshotDiff();
+  });
+
+  document.getElementById('btn-snap-save').addEventListener('click', function () {
+    saveSnapshot(null);
+  });
+  snapNameInput.addEventListener('input', function () {
+    document.getElementById('btn-snap-save').disabled =
+      state.snapshots.length >= SNAP_LIMIT && !snapNameInput.value.trim();
+  });
+  snapNameInput.addEventListener('keydown', function (e) {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      saveSnapshot(null);
+    }
+  });
+
+  // ---- 差异计算与渲染（含输入签名备忘：场景未变不重算/不重绘） ----
+  function refreshSnapshotDiff() {
+    if (state.slotA === state.slotB) {
+      // A、B 同一来源（含都指向当前场景或同一快照）：差异必为空，直接展示零差异
+      var sceneSame = slotScene(state.slotA);
+      if (!sceneSame) {
+        snapDiffEl.hidden = true;
+        snapDiffEl.innerHTML = '';
+        snapDiffHintEl.hidden = false;
+        snapDiffHintEl.textContent = '所选快照已不存在，请重新选择 A、B。';
+        state.diffSig = null;
+        return;
+      }
+      var sigSame = state.slotA + '|' + state.slotB + '|' +
+        (state.slotA === LIVE ? JSON.stringify(sceneSame) : '');
+      if (sigSame === state.diffSig) return;
+      state.diffSig = sigSame;
+      renderSnapshotDiff(Core.diffScenes(sceneSame, JSON.parse(JSON.stringify(sceneSame))));
+      return;
+    }
+
+    var sceneA = slotScene(state.slotA);
+    var sceneB = slotScene(state.slotB);
+    if (!sceneA || !sceneB) {
+      snapDiffEl.hidden = true;
+      snapDiffEl.innerHTML = '';
+      snapDiffHintEl.hidden = false;
+      snapDiffHintEl.textContent = '所选快照已不存在，请重新选择 A、B。';
+      state.diffSig = null;
+      return;
+    }
+    var sig = state.slotA + '|' + state.slotB + '|' +
+      (state.slotA === LIVE ? JSON.stringify(sceneA) : '') +
+      (state.slotB === LIVE ? JSON.stringify(sceneB) : '');
+    if (sig === state.diffSig) return; // 场景内容与槽位均未变化
+    state.diffSig = sig;
+
+    var diff = Core.diffScenes(sceneA, sceneB);
+    renderSnapshotDiff(diff);
+  }
+
+  function kindLabel(kind) {
+    return kind === 'added' ? '新增'
+      : kind === 'removed' ? '消失'
+        : kind === 'changed' ? '时刻变化' : '无变化';
+  }
+
+  function diffIntervalsHtml(intervals, cls, side, who) {
+    if (!intervals.length) return '<span class="diff-arrow">' + side + '无</span>';
+    return intervals.map(function (iv) {
+      return '<span class="diff-chip ' + cls + ' t-jump" data-t="' + iv[0] +
+        '" title="点击跳转到 ' + who + ' 进入时刻 ' + fmt(iv[0]) + 's">' +
+        fmt(iv[0]) + '–' + fmt(iv[1]) + 's</span>';
+    }).join('');
+  }
+
+  function changeSection(title, rows, whoFn) {
+    var active = rows.filter(function (r) { return r.kind !== 'unchanged'; });
+    var unchanged = rows.filter(function (r) { return r.kind === 'unchanged'; });
+    var html = '<div class="diff-sec-title">' + title + '（新增 ' +
+      rows.filter(function (r) { return r.kind === 'added'; }).length +
+      ' · 消失 ' + rows.filter(function (r) { return r.kind === 'removed'; }).length +
+      ' · 时刻变化 ' + rows.filter(function (r) { return r.kind === 'changed'; }).length +
+      (unchanged.length ? ' · 无变化 ' + unchanged.length : '') + '）</div>';
+    if (!active.length) {
+      html += '<div class="diff-none">无新增 / 消失 / 时间变化</div>';
+    }
+    active.forEach(function (r) {
+      var oldIvs = diffIntervalsHtml(r.intervalsA, 'old', 'A ', whoFn(r));
+      var newIvs = diffIntervalsHtml(r.intervalsB, 'new', 'B ', whoFn(r));
+      var jumpT = r.kind === 'removed' ? r.firstA : r.firstB;
+      html += '<div class="diff-row">' +
+        '<span class="diff-kd ' + r.kind + '">' + kindLabel(r.kind) + '</span>' +
+        '<div class="diff-body">' +
+        '<span class="df-who">' + escapeHtml(whoFn(r)) + '</span>' +
+        (jumpT !== null && jumpT !== undefined
+          ? ' <span class="diff-chip new t-jump" data-t="' + jumpT + '" title="点击跳转到该时刻">@ ' +
+            fmt(jumpT) + 's</span>' : '') +
+        '<div class="diff-ivs"><span class="diff-arrow">A：</span>' + oldIvs +
+        '<span class="diff-arrow" style="margin-left:6px">B：</span>' + newIvs +
+        '</div></div></div>';
+    });
+    return html;
+  }
+
+  function renderSnapshotDiff(diff) {
+    snapDiffHintEl.hidden = true;
+    var html = '';
+
+    // 摘要：统一时刻轴 + 两方案身份
+    html += '<div class="diff-summary">统一时刻轴 0～' + fmt(diff.T, 1) +
+      's（A ' + fmt(diff.durationA, 1) + 's / B ' + fmt(diff.durationB, 1) +
+      's），同名表演者 ' + diff.matchedPerformers.length + ' 人 · A＝' +
+      escapeHtml(slotLabel(state.slotA)) + ' → B＝' + escapeHtml(slotLabel(state.slotB)) + '</div>';
+
+    // 位置偏移
+    html += '<div class="diff-sec-title">同名表演者最大位置偏移（关键帧线性插值，点击时刻跳转）</div>';
+    if (!diff.matchedPerformers.length) {
+      html += '<div class="diff-none">两方案没有同名表演者</div>';
+    } else {
+      diff.matchedPerformers.forEach(function (mp) {
+        html += '<div class="diff-row"><span class="diff-kd changed">偏移</span>' +
+          '<div class="diff-body"><span class="df-who">' + escapeHtml(mp.name) + '</span>' +
+          ' 最大偏移 <b>' + fmt(mp.maxOffset, 1) + '</b> 单位 @ ' +
+          '<span class="diff-chip new t-jump" data-t="' + mp.maxOffsetT +
+          '" title="点击跳转到最大偏移时刻">' + fmt(mp.maxOffsetT) + 's</span></div></div>';
+      });
+    }
+    var rosterNotes = [];
+    if (diff.performersOnlyA.length) {
+      rosterNotes.push('<b>仅 A 有：</b>' + diff.performersOnlyA.map(escapeHtml).join('、'));
+    }
+    if (diff.performersOnlyB.length) {
+      rosterNotes.push('<b>仅 B 有：</b>' + diff.performersOnlyB.map(escapeHtml).join('、'));
+    }
+    if (diff.obstaclesOnlyA.length) {
+      rosterNotes.push('<b>禁入区仅 A 有：</b>' + diff.obstaclesOnlyA.map(escapeHtml).join('、'));
+    }
+    if (diff.obstaclesOnlyB.length) {
+      rosterNotes.push('<b>禁入区仅 B 有：</b>' + diff.obstaclesOnlyB.map(escapeHtml).join('、'));
+    }
+    if (rosterNotes.length) html += '<div class="diff-note">' + rosterNotes.join('<br>') + '</div>';
+
+    // 碰撞对
+    html += changeSection('碰撞对变化', diff.pairChanges, function (r) {
+      return r.nameA + ' × ' + r.nameB;
+    });
+
+    // 禁入区侵入
+    html += changeSection('禁入区侵入变化', diff.obstacleChanges, function (r) {
+      return r.performerName + ' ▣ ' + r.obstacleName;
+    });
+
+    snapDiffEl.innerHTML = html;
+    snapDiffEl.hidden = false;
+
+    // 点击任意时刻芯片（偏移时刻、首时刻、A/B 各区间进入时刻）：播放头跳到该时刻
+    Array.prototype.forEach.call(snapDiffEl.querySelectorAll('[data-t]'), function (el) {
+      el.addEventListener('click', function (e) {
+        e.stopPropagation();
+        var t = clamp(Number(el.getAttribute('data-t')), 0, state.duration);
+        seek(t);
+      });
+    });
+  }
+
   // ---------- 启动 ----------
   function fetchSample() {
     fetch('/api/sample')
@@ -1514,5 +1969,20 @@
   }
 
   document.getElementById('duration-readout').textContent = state.duration.toFixed(1);
+
+  // 方案快照：从 localStorage 恢复；前两个快照自动作为 A、B 槽位
+  state.snapshots = loadSnapshots();
+  if (state.snapshots.length >= 2) {
+    var ordered = state.snapshots.slice().sort(function (a, b) { return a.savedAt - b.savedAt; });
+    state.slotA = ordered[0].id;
+    state.slotB = ordered[1].id;
+  } else if (state.snapshots.length === 1) {
+    state.slotA = state.snapshots[0].id;
+    state.slotB = LIVE;
+  }
+  state.diffSig = null;
+  renderSlotSelectors();
+  refreshSnapshotDiff();
+
   fetchSample();
 })();
