@@ -1,0 +1,151 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>走位轨迹碰撞排练台</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-mark">◎</span>
+      <div>
+        <h1>走位轨迹碰撞排练台</h1>
+        <p class="subtitle">分段直线运动 · 二次方程连续解析求碰撞区间（无帧抽样）</p>
+      </div>
+    </div>
+    <div class="top-actions">
+      <button id="btn-obstacle" class="btn" title="在画布上拖出一个轴对齐禁入矩形（再点空白处单击可放默认尺寸）">＋ 禁入区</button>
+      <button id="btn-sample" class="btn" title="载入内置路径交叉样例">重置样例</button>
+      <button id="btn-clear" class="btn btn-ghost" title="清空全部走位点">清空</button>
+    </div>
+  </header>
+
+  <main class="layout">
+    <!-- 左：舞台 -->
+    <section class="stage-col">
+      <div class="panel">
+        <div class="panel-head">
+          <span>舞台（世界坐标 1000 × 600）</span>
+          <span class="hint">拖动圆点走位 · 双击空白加帧 · 右键圆点删帧 · 选中圆点可改安全半径 · 拖动禁入区矩形移位 · 右键矩形删除</span>
+        </div>
+        <div class="canvas-wrap">
+          <canvas id="stage" width="1000" height="600"></canvas>
+          <div id="tooltip" class="tooltip" hidden></div>
+        </div>
+        <div id="key-editor" class="key-editor" hidden>
+          <div class="ke-head">
+            <span id="ke-info" class="ke-info">关键帧</span>
+            <label class="ke-radius-edit">
+              安全半径
+              <input id="ke-radius" type="number" min="0" max="150" step="1" />
+              <button id="ke-clear" class="btn btn-mini" type="button" title="清除本帧半径，恢复继承表演者当前半径">继承</button>
+            </label>
+          </div>
+          <div id="ke-hint" class="ke-hint">留空 = 继承表演者当前半径</div>
+        </div>
+        <div id="obstacle-editor" class="key-editor obstacle-editor" hidden>
+          <div class="ke-head">
+            <span id="oe-info" class="ke-info">禁入矩形</span>
+            <label class="ke-radius-edit">名称 <input id="oe-name" type="text" /></label>
+            <label class="ke-radius-edit">
+              宽 <input id="oe-width" type="number" min="0" step="1" />
+              高 <input id="oe-height" type="number" min="0" step="1" />
+            </label>
+            <button id="oe-delete" class="btn btn-mini" type="button" title="删除该禁入矩形">✕ 删除</button>
+          </div>
+          <div class="ke-hint">轴对齐矩形：表演者按实时安全半径视为圆，连续解析侵入区间（无帧抽样）</div>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-head">
+          <div class="transport">
+            <button id="btn-play" class="btn btn-primary">▶ 播放</button>
+            <button id="btn-stop" class="btn">■ 停止</button>
+            <span class="time-readout">
+              <input id="time-input" type="number" min="0" step="0.1" value="0" />
+              / <span id="duration-readout">12.0</span> s
+            </span>
+          </div>
+          <div class="speed-group">
+            速度
+            <button class="btn btn-mini" data-speed="0.25">0.25×</button>
+            <button class="btn btn-mini active" data-speed="1">1×</button>
+            <button class="btn btn-mini" data-speed="2">2×</button>
+            <button class="btn btn-mini" data-speed="4">4×</button>
+          </div>
+        </div>
+
+        <div id="timeline" class="timeline">
+          <div class="timeline-ruler" id="timeline-ruler"></div>
+          <div id="timeline-lanes"></div>
+          <div class="timeline-playhead" id="playhead"></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- 右：表演者与结果 -->
+    <aside class="side-col">
+      <div class="panel">
+        <div class="panel-head">
+          <span>表演者（2～8 人）</span>
+          <button id="btn-add" class="btn btn-mini btn-primary">＋ 增加</button>
+        </div>
+        <div id="performers" class="performer-list"></div>
+        <div class="duration-edit">
+          总时长
+          <input id="duration-input" type="number" min="1" max="120" step="1" value="12" /> s
+        </div>
+      </div>
+
+      <div class="panel panel-summary">
+        <div class="summary-row">
+          <div class="summary-item">
+            <label>首次碰撞时刻</label>
+            <strong id="sum-first">—</strong>
+          </div>
+          <div class="summary-item">
+            <label>当事人</label>
+            <strong id="sum-first-who">—</strong>
+          </div>
+        </div>
+        <div class="summary-row">
+          <div class="summary-item">
+            <label>全局最小间距</label>
+            <strong id="sum-min">—</strong>
+          </div>
+          <div class="summary-item">
+            <label>出现时刻 / 当事人</label>
+            <strong id="sum-min-who">—</strong>
+          </div>
+        </div>
+        <div class="summary-row clickable" id="sum-margin-row" title="点击跳转播放头到最小余量发生时刻">
+          <div class="summary-item">
+            <label>最小安全余量（间距 − 半径和）</label>
+            <strong id="sum-margin">—</strong>
+          </div>
+          <div class="summary-item">
+            <label>出现时刻 / 当事人</label>
+            <strong id="sum-margin-who">—</strong>
+          </div>
+        </div>
+      </div>
+
+      <div class="panel panel-pairs" id="panel-obstacles" hidden>
+        <div class="panel-head"><span>禁入区侵入（按首次进入时刻升序 · 点击结果跳到进入时刻）</span></div>
+        <div id="obstacle-results" class="pair-list"></div>
+      </div>
+
+      <div class="panel panel-pairs">
+        <div class="panel-head"><span>逐对结果（按最小安全余量升序）</span></div>
+        <div id="pairs" class="pair-list"></div>
+      </div>
+    </aside>
+  </main>
+
+  <script src="core.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
